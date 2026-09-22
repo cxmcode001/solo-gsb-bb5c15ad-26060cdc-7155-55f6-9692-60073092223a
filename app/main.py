@@ -15,7 +15,7 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
 from .database import Base, engine, get_db
@@ -34,15 +34,19 @@ from .schemas import (
     EventCreate,
     EventOut,
     HashOut,
+    RevealBatchCreate,
+    RevealBatchOut,
     RevealCreate,
     RevealOut,
     TimelineOut,
 )
 
-# 批量提交逐项冲突类型
+# 批量提交/揭示逐项冲突类型
 INVALID_FORMAT = "INVALID_FORMAT"
 DUPLICATE_IN_REQUEST = "DUPLICATE_IN_REQUEST"
 DUPLICATE_COMMITMENT = "DUPLICATE_COMMITMENT"
+NO_MATCHING_COMMITMENT = "NO_MATCHING_COMMITMENT"
+DUPLICATE_REVEAL = "DUPLICATE_REVEAL"
 
 logger = logging.getLogger("sealed-predictions")
 
@@ -585,6 +589,165 @@ def submit_reveal(event_id: UUID, payload: RevealCreate, db: Session = Depends(g
         revealed_at=as_utc(reveal.created_at),
         verified=True,
     )
+
+
+@app.post(
+    "/events/{event_id}/reveals/batch",
+    status_code=201,
+    response_model=RevealBatchOut,
+)
+def submit_reveals_batch(
+    event_id: UUID, payload: RevealBatchCreate, db: Session = Depends(get_db)
+):
+    """在单个数据库事务中原子批量揭示 1～100 组原文与盐（仅揭示期）。
+
+    所有写入前的校验按输入顺序完成，任何一项冲突即整体回滚（不留下
+    部分揭示），并返回 409 与逐项冲突清单：
+      - INVALID_FORMAT：盐为空或超过 256 字符（与单个揭示端点的约束一致）
+      - DUPLICATE_IN_REQUEST：重算哈希在本次请求内重复（第二次及以后出现的下标）
+      - NO_MATCHING_COMMITMENT：重算哈希不匹配本事件中的任何承诺
+      - DUPLICATE_REVEAL：匹配的承诺已被揭示（仅首次揭示生效）
+    格式非法优先于重复判定；冲突清单按下标升序，每个下标至多一项。
+    全部通过时按输入顺序在同一事务中写入，并以相同顺序返回记录。
+    """
+    event = get_event_or_404(db, event_id)
+    now = now_utc()
+    commit_dl = as_utc(event.commit_deadline)
+    reveal_dl = as_utc(event.reveal_deadline)
+    if now < commit_dl:
+        raise api_error(
+            409,
+            "REVEAL_PHASE_NOT_STARTED",
+            f"揭示期自 {commit_dl.isoformat()} 开始，当前服务端时间 {now.isoformat()}，提前揭示被拒绝",
+        )
+    if now >= reveal_dl:
+        raise api_error(
+            409,
+            "REVEAL_PHASE_CLOSED",
+            f"揭示截止时间为 {reveal_dl.isoformat()}，当前服务端时间 {now.isoformat()}，逾期揭示被拒绝",
+        )
+
+    items = payload.reveals
+    recomputed = [compute_commitment(it.original_text, it.salt) for it in items]
+    conflicts: list[dict] = []
+
+    # 1) 按输入顺序校验格式：盐须为 1～256 字符（与单个揭示端点一致）
+    valid_format: list[bool] = []
+    for i, it in enumerate(items):
+        ok = 1 <= len(it.salt) <= 256
+        valid_format.append(ok)
+        if not ok:
+            conflicts.append(
+                {"index": i, "type": INVALID_FORMAT, "recomputed_hash": recomputed[i]}
+            )
+
+    # 2) 按输入顺序检查请求内重复（仅对格式合法的项；保留首次出现）
+    first_index: dict[str, int] = {}  # 重算哈希 -> 请求内首次出现下标
+    for i, h in enumerate(recomputed):
+        if not valid_format[i]:
+            continue
+        if h in first_index:
+            conflicts.append(
+                {"index": i, "type": DUPLICATE_IN_REQUEST, "recomputed_hash": h}
+            )
+            continue
+        first_index[h] = i
+
+    # 3) 同事务内一次性查询匹配的承诺及其揭示状态；仅在请求内首次出现的
+    #    下标上报库冲突，后续重复已归为 DUPLICATE_IN_REQUEST
+    commitments_by_hash: dict[str, Commitment] = {}
+    if first_index:
+        rows = (
+            db.query(Commitment)
+            .options(joinedload(Commitment.reveal))
+            .filter(
+                Commitment.event_id == event.id,
+                Commitment.commitment_hash.in_(list(first_index)),
+            )
+            .all()
+        )
+        commitments_by_hash = {c.commitment_hash: c for c in rows}
+        for h, i in first_index.items():
+            commitment = commitments_by_hash.get(h)
+            if commitment is None:
+                conflicts.append(
+                    {"index": i, "type": NO_MATCHING_COMMITMENT, "recomputed_hash": h}
+                )
+            elif commitment.reveal is not None:
+                conflicts.append(
+                    {"index": i, "type": DUPLICATE_REVEAL, "recomputed_hash": h}
+                )
+
+    if conflicts:
+        # 尚未执行任何 INSERT：显式回滚以结束事务，保证不留任何写入
+        db.rollback()
+        conflicts.sort(key=lambda c: c["index"])
+        raise api_error(
+            409,
+            "BATCH_REVEAL_CONFLICT",
+            f"批量揭示包含 {len(conflicts)} 个冲突项，已整体回滚，未写入任何揭示",
+            conflicts=conflicts,
+        )
+
+    # 4) 全部通过：按输入顺序在同一事务中写入
+    reveals = [
+        Reveal(
+            event_id=event.id,
+            commitment_id=commitments_by_hash[h].id,
+            original_text=it.original_text,
+            salt=it.salt,
+            recomputed_hash=h,
+        )
+        for it, h in zip(items, recomputed)
+    ]
+    db.add_all(reveals)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发竞争：预检后、提交前另一事务揭示了其中某个承诺。回滚并重新
+        # 读取揭示状态，依旧给出逐项清单，保证不留下部分揭示
+        db.rollback()
+        revealed_hashes = {
+            row[0]
+            for row in (
+                db.query(Commitment.commitment_hash)
+                .join(Reveal, Reveal.commitment_id == Commitment.id)
+                .filter(
+                    Commitment.event_id == event.id,
+                    Commitment.commitment_hash.in_(recomputed),
+                )
+                .all()
+            )
+        }
+        race_conflicts = [
+            {"index": i, "type": DUPLICATE_REVEAL, "recomputed_hash": h}
+            for i, h in enumerate(recomputed)
+            if h in revealed_hashes
+        ]
+        race_conflicts.sort(key=lambda c: c["index"])
+        raise api_error(
+            409,
+            "BATCH_REVEAL_CONFLICT",
+            f"批量揭示包含 {len(race_conflicts)} 个冲突项，已整体回滚，未写入任何揭示",
+            conflicts=race_conflicts,
+        )
+
+    out: list[RevealOut] = []
+    for reveal, h in zip(reveals, recomputed):
+        commitment = commitments_by_hash[h]
+        out.append(
+            RevealOut(
+                id=reveal.id,
+                event_id=event.id,
+                commitment_id=commitment.id,
+                commitment_hash=commitment.commitment_hash,
+                recomputed_hash=h,
+                hash_scheme=HASH_SCHEME,
+                revealed_at=as_utc(reveal.created_at),
+                verified=True,
+            )
+        )
+    return RevealBatchOut(count=len(reveals), reveals=out)
 
 
 # --------------------------------------------------------------------------- #

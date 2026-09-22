@@ -47,6 +47,20 @@ class RevealCreate(BaseModel):
     salt: str = Field(min_length=1, max_length=256, description="随机盐（UTF-8）")
 
 
+class RevealItemCreate(BaseModel):
+    # 盐的长度不在此处约束：格式非法是逐项冲突（409）而非请求体 422
+    original_text: str = Field(description="预测原文（UTF-8）")
+    salt: str = Field(description="随机盐（UTF-8）；须为 1～256 字符，否则计为 INVALID_FORMAT 冲突")
+
+
+class RevealBatchCreate(BaseModel):
+    reveals: list[RevealItemCreate] = Field(
+        min_length=1,
+        max_length=100,
+        description="1～100 组原文与盐，按输入顺序在揭示期内重算哈希并匹配承诺",
+    )
+
+
 class DeadlineExtensionCreate(BaseModel):
     commit_deadline: datetime = Field(description="新的提交截止时间（须含时区，建议 UTC）")
     reveal_deadline: datetime = Field(description="新的揭示截止时间（须含时区，建议 UTC）")
@@ -102,6 +116,11 @@ class RevealOut(BaseModel):
     hash_scheme: str
     revealed_at: datetime
     verified: bool
+
+
+class RevealBatchOut(BaseModel):
+    count: int = Field(description="本次写入的揭示数量（等于输入组数）")
+    reveals: list[RevealOut] = Field(description="按输入顺序写入的揭示记录")
 
 
 class TimelineEntry(BaseModel):
