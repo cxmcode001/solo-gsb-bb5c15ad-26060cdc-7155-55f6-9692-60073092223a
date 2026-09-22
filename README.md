@@ -57,6 +57,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | POST | `/events/{id}/commitments/batch` | 原子批量提交 1～100 个承诺（单事务，冲突整体回滚） |
 | GET | `/events/{id}/commitments` | 承诺列表（含是否已揭示） |
 | POST | `/events/{id}/reveals` | 揭示：提交原文 + 盐，服务端重算校验 |
+| POST | `/events/{id}/reveals/batch` | 原子批量揭示 1～100 组原文与盐（单事务，冲突整体回滚） |
 | GET | `/events/{id}/timeline` | 可核验的事件时间线 |
 | POST | `/utils/commitment` | 按约定方案计算承诺哈希 |
 | GET | `/health` | 健康检查 |
@@ -256,6 +257,77 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/commitments/batch \
 已过 `commit_deadline` 与单个提交端点一致返回 `409 COMMIT_PHASE_CLOSED`，
 以上情形同样不产生任何写入。
 
+## 原子批量揭示（`POST /events/{id}/reveals/batch`）
+
+进入揭示期后，可在**单个数据库事务**中按输入顺序提交 1～100 组「原文 + 盐」。
+服务端按约定方案逐项重算哈希并与该事件的承诺匹配，**所有项目先完成全部校验，
+任何一项冲突都整体回滚**，不会留下部分揭示：
+
+- 逐项校验格式（盐须为 1～256 字符的字符串）；
+- 按重算哈希检查请求内重复（第二次及以后出现的下标记为请求内重复）；
+- 一次性查询命中的承诺（并对这些承诺加行锁，串行化并发批量揭示），判定
+  「无匹配承诺」与「承诺已揭示」；
+- 仅在揭示期内可调用：提前揭示返回 `409 REVEAL_PHASE_NOT_STARTED`，
+  逾期揭示返回 `409 REVEAL_PHASE_CLOSED`（与单个揭示端点一致）。
+
+冲突时返回 `409 BATCH_REVEAL_CONFLICT`，统一错误结构内附 `conflicts` 数组，
+每项给出 `index`（从 0 开始的输入下标）与 `type`，按下标升序、每个下标至多
+一项；除格式非法项外均附带 `recomputed_hash`，每项都回显提交时的原文与盐：
+
+| 冲突 type | 含义 |
+|-----------|------|
+| `INVALID_FORMAT` | 盐为空或超过 256 字符（原文允许任意 UTF-8 文本，含空串） |
+| `DUPLICATE_IN_REQUEST` | 重算哈希在本次请求中重复（首次出现之后的下标） |
+| `NO_MATCHING_COMMITMENT` | 重算哈希不匹配本事件中的任何承诺 |
+| `DUPLICATE_REVEAL` | 匹配到的承诺此前已被揭示（请求内首次出现的下标） |
+
+```bash
+# 成功：揭示期内按输入顺序一次事务写入，返回 count 与揭示记录（201）
+curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"reveals": [
+        {"original_text": "明天下雨", "salt": "my-random-salt-1"},
+        {"original_text": "明年晴天", "salt": "my-random-salt-2"}
+      ]}'
+# => {"count": 2, "reveals": [{...verified: true...}, {...}]}
+
+# 冲突：整体回滚（409），逐项指出冲突下标与类型
+curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"reveals": [
+        {"original_text": "明天下雨", "salt": "my-random-salt-1"},
+        {"original_text": "错误原文", "salt": "wrong-salt"},
+        {"original_text": "明天下雨", "salt": "my-random-salt-1"}
+      ]}'
+```
+
+```json
+{
+  "detail": {
+    "code": "BATCH_REVEAL_CONFLICT",
+    "message": "批量揭示包含 3 个冲突项，已整体回滚，未创建任何揭示",
+    "conflicts": [
+      {"index": 0, "type": "DUPLICATE_REVEAL",
+       "original_text": "明天下雨", "salt": "my-random-salt-1",
+       "recomputed_hash": "…"},
+      {"index": 1, "type": "NO_MATCHING_COMMITMENT",
+       "original_text": "错误原文", "salt": "wrong-salt",
+       "recomputed_hash": "…"},
+      {"index": 2, "type": "DUPLICATE_IN_REQUEST",
+       "original_text": "明天下雨", "salt": "my-random-salt-1",
+       "recomputed_hash": "…"}
+    ]
+  }
+}
+```
+
+列表为空或超过 100 项、请求体结构错误（如项不是对象、缺少 `original_text`
+或 `salt`、字段类型错误）返回 422；事件不存在返回 `404 EVENT_NOT_FOUND`，
+以上情形均不产生任何写入。批量端点与单个揭示端点共享同一套存储与唯一约束：
+**并发下仅首次揭示生效**——预检阶段对命中的承诺加行锁（PostgreSQL），
+提交阶段再由 `reveals.commitment_id` 唯一约束兜底，竞争落败的整批请求回滚并
+收到逐项 `DUPLICATE_REVEAL` 清单。
+
 ## 错误响应
 
 错误统一返回 `{"detail": {"code": "...", "message": "..."}}`，且**均不改变任何状态**
@@ -274,6 +346,7 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/commitments/batch \
 | 409 | `REVEAL_PHASE_CLOSED` | 逾期揭示（已过 reveal_deadline） |
 | 409 | `NO_MATCHING_COMMITMENT` | 原文 + 盐重算后不匹配任何承诺 |
 | 409 | `DUPLICATE_REVEAL` | 该承诺已被揭示（仅首次匹配生效） |
+| 409 | `BATCH_REVEAL_CONFLICT` | 批量揭示存在逐项冲突（`detail.conflicts` 给出每个冲突项的 index/type 与原文、盐、重算哈希） |
 | 422 | — | 请求体格式校验失败（如哈希非 64 位十六进制、截止时间无时区、延长缺少 reason） |
 
 「仅首次匹配的揭示生效」由 `reveals.commitment_id` 唯一约束保证：并发揭示同一承诺时，
@@ -281,11 +354,49 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/commitments/batch \
 
 ## 本地开发与测试
 
+### Docker Compose 启动（推荐）
+
+前置条件：已安装 Docker 与 Docker Compose Plugin（`docker compose version` 可用）。
+
+```bash
+docker compose up --build       # 前台启动（加 -d 后台运行）
+docker compose ps               # 查看两个容器健康状态（db / api 均为 healthy 即就绪）
+docker compose logs -f api      # 跟踪 API 日志（含「database schema ready」建表日志）
+docker compose down             # 停止并删除容器（保留数据卷）
+docker compose down -v          # 停止并连同 Postgres 数据卷 pgdata 一起删除（彻底重置）
+```
+
+Compose 编排说明（见 `docker-compose.yml`）：
+
+- **db**：PostgreSQL 16（`postgres:16-alpine`），库名/用户名/密码均为
+  `postgres` / `postgres` / `predictions`，数据持久化在命名卷 `pgdata` 中，
+  宿主端口 `5432`；自带 `pg_isready` healthcheck。
+- **api**：由仓库 `Dockerfile` 构建（`python:3.12-slim` + `requirements.txt`，
+  启动命令为 `uvicorn app.main:app --host 0.0.0.0 --port 8000`），
+  通过 `depends_on: condition: service_healthy` 等待数据库健康后再启动，
+  启动时自动建表（`events` / `commitments` / `reveals` /
+  `deadline_extensions`），宿主端口 `8000`；自带 `/health` healthcheck。
+- API 通过环境变量 `DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/predictions`
+  连接数据库；如本机 5432 或 8000 端口被占用，可在 `docker-compose.yml`
+  中修改 `ports` 映射（容器内端口不变）。
+
+启动后即可访问：
+
+- API 地址：**http://localhost:8000**
+- 交互式文档（Swagger UI）：**http://localhost:8000/docs**
+- 健康检查：`curl http://localhost:8000/health` → `{"status":"ok"}`
+
+### 不使用 Docker（本地直跑）
+
 ```bash
 pip install -r requirements-dev.txt
 DATABASE_URL=sqlite:///./dev.db uvicorn app.main:app --reload   # 本地运行（默认连 PostgreSQL）
 python3 -m pytest tests/ -q                                     # 运行测试（SQLite + 模拟时钟）
 ```
+
+测试使用临时 SQLite 文件库并猴子补丁服务端时钟，无需启动 Postgres；
+生产/Compose 环境的行锁（`SELECT … FOR UPDATE`）在 SQLite 上自动降级为普通
+查询，并发正确性仍由唯一约束保证。
 
 ## 项目结构
 
@@ -300,6 +411,8 @@ app/
 tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
 tests/test_conflicts.py       # 冲突分析：sweep-line 边界、排序与 API 用例
 tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制、幂等与时间线
+tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
+tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

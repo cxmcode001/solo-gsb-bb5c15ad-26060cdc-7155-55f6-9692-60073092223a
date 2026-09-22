@@ -47,6 +47,21 @@ class RevealCreate(BaseModel):
     salt: str = Field(min_length=1, max_length=256, description="随机盐（UTF-8）")
 
 
+class RevealBatchItem(BaseModel):
+    # 不在此处施加盐的长度约束：盐为空/超长是逐项冲突（INVALID_FORMAT，409），
+    # 而非整个请求体的 422；字段类型错误或字段缺失才是请求体 422
+    original_text: str = Field(description="预测原文（UTF-8）")
+    salt: str = Field(description="随机盐（UTF-8，1～256 字符）")
+
+
+class RevealBatchCreate(BaseModel):
+    reveals: list[RevealBatchItem] = Field(
+        min_length=1,
+        max_length=100,
+        description="1～100 组原文与盐，按输入顺序在同一事务中原子揭示",
+    )
+
+
 class DeadlineExtensionCreate(BaseModel):
     commit_deadline: datetime = Field(description="新的提交截止时间（须含时区，建议 UTC）")
     reveal_deadline: datetime = Field(description="新的揭示截止时间（须含时区，建议 UTC）")
@@ -102,6 +117,11 @@ class RevealOut(BaseModel):
     hash_scheme: str
     revealed_at: datetime
     verified: bool
+
+
+class RevealBatchOut(BaseModel):
+    count: int = Field(description="本次写入的揭示数量（等于输入组数）")
+    reveals: list[RevealOut] = Field(description="按输入顺序写入的揭示记录，全部 verified=true")
 
 
 class TimelineEntry(BaseModel):
